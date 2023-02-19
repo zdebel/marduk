@@ -303,7 +303,7 @@ uint8_t vdpint = 0;
 uint8_t interrupts = 0;
 uint8_t prev_int_line = 0;
 
-void update_interrupts()
+int update_interrupts()
 {
   if (hccarint)
   {
@@ -352,10 +352,12 @@ void update_interrupts()
   {
     // z80_gen_int(&cpu, (Q0 << 6) | (Q1 << 1) | (Q2 << 7));
     z80_gen_int(&cpu, psg_portb & 0x0e);
+    return interrupts & psg_porta;
     // z80_gen_int(&cpu, prev_int_line);
     // prev_int_line = (Q0 << 5) | (Q1 << 6) | (Q2 << 7);
     // z80_gen_int(&cpu, !GS);
   }
+  return 0;
 }
 
 char keyboard_buffer[256];
@@ -1610,6 +1612,12 @@ int main(int argc, char **argv)
       }
       next += 228;
     }
+    int rc_int = update_interrupts();
+    /*
+    if (rc_int) {
+      printf("INT: %02X\r\n", rc_int);
+    }
+    */
     z80_step(&cpu);
   }
   
