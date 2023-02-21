@@ -26,6 +26,8 @@
  *       similar license terms.
  */
 
+#define VERSION "0.25a"
+
 /* C99 includes */
 #include <errno.h>
 #include <stdint.h>
@@ -70,19 +72,24 @@
 /* Alterable filenames */
 #include "paths.h"
 
-#define VERSION "0.23h"
-
 /*
  * Forward declarations.
  */
 static void reinit_cpu(void);
 void fatal_diag(int, char *);
 
+/* Extern declaration */
+void cpustatus (z80 *cpu);
+
+int trace;
+
 /*
  * Speed control.
  *
  * Not exact, but it helps keep the speed more or less even based on how long
  * it takes to run one scanline's worth of code.
+ * 
+ * XXX: no support for this on MS-DOS.
  */
 #ifdef __MSDOS__
 
@@ -116,6 +123,7 @@ PSG *psg;
 int ctrlreg;
 
 int gotmodem;
+unsigned dog_speed;
 
 /* Next cycle for scanline loop. */
 unsigned long next;
@@ -129,6 +137,7 @@ unsigned next_watchdog;
 /* keyboard/joystick? */
 int keyjoy;
 uint8_t joybyte;
+#define JOY_THRESH 2048 /* distance from center to "trip"; 0..32767 */
 
 #ifdef __MSDOS__
 /*
@@ -150,6 +159,7 @@ SDL_Renderer *renderer;
 SDL_Texture *texture;
 SDL_AudioDeviceID audio_device;
 SDL_AudioSpec audio_spec;
+SDL_Joystick *joystick;
 
 uint32_t *display;
 #endif
@@ -273,7 +283,7 @@ void int_prio_enc(int EI, int I0, int I1, int I2, int I3, int I4, int I5, int I6
   }
   else
   {
-    *Q0 = *Q1 = *Q2;
+    *Q0 = *Q1 = *Q2 = 1;
   }
 }
 
@@ -348,16 +358,7 @@ int update_interrupts()
   A1 - D2
   A2 - D8
   */
-  if (!GS)
-  {
-    // z80_gen_int(&cpu, (Q0 << 6) | (Q1 << 1) | (Q2 << 7));
-    z80_gen_int(&cpu, psg_portb & 0x0e);
-    return interrupts & psg_porta;
-    // z80_gen_int(&cpu, prev_int_line);
-    // prev_int_line = (Q0 << 5) | (Q1 << 6) | (Q2 << 7);
-    // z80_gen_int(&cpu, !GS);
-  }
-  return 0;
+  z80_gen_int(&cpu, !GS, psg_portb & 0x0e);
 }
 
 char keyboard_buffer[256];
@@ -416,7 +417,6 @@ uint8_t port_read(z80 *mycpu, uint8_t port)
     return 0;
   case 0x90: /* Not sure if this is the right action */
     t = keyboard_buffer_get();
-    // printf("KEYBOARD returned 0x%02X\r\n", t);
     keybdint = 0;
     update_interrupts();
     if (t == 255)
@@ -429,7 +429,6 @@ uint8_t port_read(z80 *mycpu, uint8_t port)
     return vrEmuTms9918ReadData(vdp);
   case 0xA1: /* Not sure if this is the right action */
     b = vrEmuTms9918ReadStatus(vdp);
-    // printf("VDP STATUS: 0x%02X\r\n", b);
     vdpint = 0;
     update_interrupts();
     return b;
@@ -457,11 +456,10 @@ void port_write(z80 *mycpu, uint8_t port, uint8_t val)
       {
         diag_printf("Writing to PORTA when it's set to input, DENIED!\r\n");
         diag_printf("psg_reg7 = %02X\r\n", psg_reg7);
-        // return;
       }
       if (val & 0x10)
       {
-        // printf("Bro, we want VDPINT for real, psg_reg7: 0x%02X, interrupts: 0x%02X\r\n", psg_reg7, interrupts);
+
       }
       if (psg_porta != val)
       {
@@ -475,7 +473,6 @@ void port_write(z80 *mycpu, uint8_t port, uint8_t val)
       {
         diag_printf("Writing to PORTB when it's set to input, DENIED!\r\n");
         diag_printf("psg_reg7 = %02X\r\n", psg_reg7);
-        // return;
       }
     }
     PSG_writeReg(psg, psg_reg_address, val);
@@ -507,6 +504,12 @@ void port_write(z80 *mycpu, uint8_t port, uint8_t val)
 }
 
 #ifdef __MSDOS__
+
+/*
+ * XXX: We need a better way to do this to detect make and break from the 
+ *      relevant keys.  Like, say, grabbing INT9.  (But I'm not familiar with
+ *      that kind of stuff in 386 mode... -uso.)
+ */
 void keyboard_poll()
 {
  __dpmi_regs regs;
@@ -626,6 +629,74 @@ void keyboard_poll(void)
   /* eat up all events */
   while (SDL_PollEvent(&event))
   {
+    /* These are irrelevant if the keyboard is emulating the joystick */
+    if (!keyjoy)
+    {
+     /* Don't care what stick or what button.  Nabu only has one. */
+     switch (event.type)
+     {
+      case SDL_JOYHATMOTION:
+       joybyte&=0xF0;
+       switch (event.jhat.value)
+       {
+        case SDL_HAT_LEFTUP:
+         joybyte|=0x09;
+         break;
+        case SDL_HAT_UP:
+         joybyte|=0x08;
+         break;
+        case SDL_HAT_RIGHTUP:
+         joybyte|=0x0C;
+         break;
+        case SDL_HAT_LEFT:
+         joybyte|=0x01;
+         break;
+        case SDL_HAT_CENTERED:
+         /* Already done */
+         break;
+        case SDL_HAT_RIGHT:
+         joybyte|=0x04;
+         break;
+        case SDL_HAT_LEFTDOWN:
+         joybyte|=0x03;
+         break;
+        case SDL_HAT_DOWN:
+         joybyte|=0x02;
+         break;
+        case SDL_HAT_RIGHTDOWN:
+         joybyte|=0x06;
+         break;
+       }
+      case SDL_JOYAXISMOTION:
+       joybyte&=0xF0;
+       switch (event.jaxis.axis)
+       {
+        case 0: /* X */
+         if (event.jaxis.value<-JOY_THRESH)
+          joybyte|=0x01;
+         else if (event.jaxis.value>JOY_THRESH)
+          joybyte|=0x04;
+         break;
+        case 1: /* Y */
+         if (event.jaxis.value<-JOY_THRESH)
+          joybyte|=0x08;
+         else if (event.jaxis.value>JOY_THRESH)
+          joybyte|=0x02;
+         break;
+       }
+       break;
+      case SDL_JOYBUTTONDOWN:
+       joybyte |= 0x10;
+       keyboard_buffer_put(0x80);
+       keyboard_buffer_put(joybyte|0xA0);
+       break;
+      case SDL_JOYBUTTONUP:
+       joybyte &= 0xEF;
+       keyboard_buffer_put(0x80);
+       keyboard_buffer_put(joybyte|0xA0);
+       break;
+     }
+    }
     switch (event.type)
     {
     /*
@@ -704,8 +775,8 @@ void keyboard_poll(void)
       break;
     case SDL_KEYDOWN:
       /*
-         * "Make key" codes for arrows.
-         */
+       * "Make key" codes for arrows.
+       */
       switch (event.key.keysym.sym)
       {
        case ' ':
@@ -785,6 +856,7 @@ void keyboard_poll(void)
         static char *shiftnums = ")!@#$%^&*(";
         SDL_Keymod m;
         int k;
+        
         /*
          * Shift/Ctrl translation.  Not the most efficient method.
          *
@@ -797,6 +869,8 @@ void keyboard_poll(void)
          */
 
         k = event.key.keysym.sym;
+        if ((k==' ')&&keyjoy) break; /* we already handled this. */
+        
         m = SDL_GetModState();
         if (m & KMOD_CTRL)
         {
@@ -864,15 +938,6 @@ void keyboard_poll(void)
         switch (event.key.keysym.sym)
         {
         /* F3 - reset */
-         case SDLK_F5:
-          keyjoy=0;
-          joybyte=0;
-          diag_printf ("Arrows and Space are KEYBOARD\n");
-          break;
-         case SDLK_F6:
-          keyjoy=1;
-          diag_printf ("Arrows and Space are JOYSTICK\n");
-          break;
         case SDLK_F3:
           diag_printf("Reset pressed\n");
 #ifndef _WIN32
@@ -885,6 +950,19 @@ void keyboard_poll(void)
         case SDLK_F4:
           if (SDL_GetModState() & KMOD_ALT)
             death_flag = 1;
+          break;
+         case SDLK_F5:
+          keyjoy=0;
+          joybyte=0;
+          diag_printf ("Arrows and Space are KEYBOARD\n");
+          break;
+         case SDLK_F6:
+          keyjoy=1;
+          diag_printf ("Arrows and Space are JOYSTICK\n");
+          break;
+         case SDLK_F7:
+          trace=!trace;
+          diag_printf ("CPU Trace is now %s\n", trace?"ON":"OFF");
           break;
         /* F10 - also exit */
         case SDLK_F10:
@@ -1082,16 +1160,21 @@ void render_scanline(int line)
      {
       for (c=576; c<584; c++)
       {
-       display[r+c]=display[r+640+c]=0xFFFFFFFF;
+       display[r+c]=display[r+640+c]=0xFF333333;
       }
+     }
+     else if (line==232)
+     {
+      display[r+579]=display[r+580]=0xFFCC0000;
+      display[r+579+640]=display[r+580+640]=0xFF333333;
      }
      else
      {
-      display[r+579]=display[r+579+640]=0xFFFFFFFF;
-      display[r+580]=display[r+580+640]=0xFFFFFFFF;
+      display[r+579]=display[r+579+640]=0xFF333333;
+      display[r+580]=display[r+580+640]=0xFF333333;
      }
       
-     if (line==234) display[r+577]=display[r+577+640]=0xFFFFFFFF;
+     if (line==234) display[r+577]=display[r+577+640]=0xFFCC0000;
     }
 
     if (line == 232)
@@ -1279,7 +1362,6 @@ void initty(void)
  if (!__djgpp_nearptr_enable())
  {
   fatal_diag (2, "FATAL: Could not get access to 8086 memory");
-  exit(2);
  }
  
  /* Enter MCGA graphics mode */
@@ -1313,6 +1395,13 @@ void initty(void)
  palette (0x1F, 0xFF, 0xFF, 0xFF);
 }
 
+/* Restore last tty state */
+void reinitty(void)
+{
+ initty();
+ memcpy (vgamem, display, 64000);
+}
+
 void deinitty(void)
 {
  __dpmi_regs regs;
@@ -1336,6 +1425,49 @@ void fatal_diag (int code, char *message)
  exit(code);
 }
 
+/*
+ * This is a stub.
+ * 
+ * Currently, when "trace" is on, we just dump the registers once a Z80
+ * operation.  This may be extended at some point in the future into a
+ * framework for a proper debugger.
+ * 
+ * This code is called from nowhere.
+ */
+void debugger (void)
+{
+ char buf[128];
+ 
+#ifdef __MSDOS__
+ deinitty();
+#endif
+ 
+ while (1)
+ {
+  cpustatus(&cpu);
+  putchar ('-');
+top:
+  fgets(buf, 127, stdin);
+  if (feof(stdin))
+  {
+   death_flag=1;
+   return;
+  }
+  buf[strlen(buf)-1]=0;
+  if (!*buf) return;
+  
+  if (*buf=='q')
+  {
+   death_flag=1;
+   return;
+  }
+ }
+ 
+#ifdef __MSDOS__
+ reinitty();
+#endif
+}
+
 int main(int argc, char **argv)
 {
   int e;
@@ -1344,6 +1476,7 @@ int main(int argc, char **argv)
   char *server, *port;
   int scanline;
   int noinitmodem;
+  int dojoy;
   
 #ifdef __MSDOS__
   ttyup=0;
@@ -1352,15 +1485,18 @@ int main(int argc, char **argv)
 
   SDL_GetVersion(&sdlver);
 #endif
-  
+
+  dojoy=0;
+  trace=0;
   noinitmodem=0;
+  dog_speed=58000;
 
   /* This is still relevant for MS-DOS, thank you Watt-32 */
   server = "127.0.0.1";
   port = "5816";
   
   bios = ROMFILE1;
-  while (-1 != (e = getopt(argc, argv, "48B:S:P:N")))
+  while (-1 != (e = getopt(argc, argv, "48B:jJS:P:N")))
   {
     switch (e)
     {
@@ -1370,6 +1506,12 @@ int main(int argc, char **argv)
     case '8':
       bios = ROMFILE2;
       break;
+    case 'j':
+     dojoy=0;
+     break;
+    case 'J':
+     dojoy=1;
+     break;
     case 'B':
       bios = optarg;
       break;
@@ -1384,7 +1526,7 @@ int main(int argc, char **argv)
       break;
     default:
       fprintf(stderr, 
-              "usage: %s [-4 | 8 | -B filename] [-S server] [-P port]\n",
+              "usage: %s [-4 | 8 | -B filename] [-J] [-S server] [-P port]\n",
               argv[0]);
       return 1;
     }
@@ -1470,6 +1612,11 @@ int main(int argc, char **argv)
 
   audio_device = SDL_OpenAudioDevice(NULL, 0, &audio_spec, NULL, 0);
   SDL_PauseAudioDevice(audio_device, 0);
+  
+  if (dojoy)
+   joystick=SDL_JoystickOpen(0); /* non-fatal; just NULL if none attached */
+  else
+   joystick=NULL;
 #endif
 
   /*
@@ -1496,7 +1643,7 @@ int main(int argc, char **argv)
   }
   PSG_setVolumeMode(psg, 2);
   PSG_reset(psg);
-
+  
   /*
    * Load the ROM, then set it visible.
    */
@@ -1574,7 +1721,6 @@ int main(int argc, char **argv)
       {
         keybdint = 1;
         update_interrupts();
-        // printf("KEYBOARD: int! %d %d\r\n", keyboard_buffer_read_ptr, keyboard_buffer_write_ptr);
       }
 
       every_scanline();
@@ -1583,10 +1729,9 @@ int main(int argc, char **argv)
       if (keyboard_buffer_empty())
       {
         next_watchdog++;
-        if (next_watchdog >= 58000)
+        if (next_watchdog >= dog_speed)
         {
           next_watchdog = 0;
-          diag_printf("Keyboard: kicking the dog\n");
           keyboard_buffer_put(0x94);
         }
       }
@@ -1606,18 +1751,14 @@ int main(int argc, char **argv)
           {
             vdpint = 1;
             update_interrupts();
-            // printf("vdpint!\r\n");
           }
         }
       }
       next += 228;
     }
-    int rc_int = update_interrupts();
-    /*
-    if (rc_int) {
-      printf("INT: %02X\r\n", rc_int);
-    }
-    */
+#ifndef __MSDOS__
+    if (trace) cpustatus(&cpu);
+#endif
     z80_step(&cpu);
   }
   
@@ -1633,6 +1774,8 @@ int main(int argc, char **argv)
   vrEmuTms9918Destroy(vdp);
   free(display);
 #ifndef __MSDOS__
+  if (joystick)
+   SDL_JoystickClose(joystick);
   SDL_Quit();
 #endif
 
