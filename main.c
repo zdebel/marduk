@@ -313,7 +313,7 @@ uint8_t vdpint = 0;
 uint8_t interrupts = 0;
 uint8_t prev_int_line = 0;
 
-int update_interrupts()
+void update_interrupts()
 {
   if (hccarint)
   {
