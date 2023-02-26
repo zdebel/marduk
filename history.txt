@@ -1,3 +1,36 @@
+0.25g (23022221)
+================
+
+  * Third attempt at supporting the parallel port
+
+0.25f (23022221)
+================
+
+  * Second attempt at supporting the parallel port
+
+0.25e (23022221)
+================
+
+  * First attempt at supporting the parallel port (-p file)
+
+0.25d (23022219)
+================
+
+  * Code cleanup, rearrangement, minor fixes, more comments
+
+0.25c (23022217)
+================
+
+  * Fix for joystick causing silent death on Windows
+
+0.25b (23022211)
+================
+
+  * On OSes other than MS-DOS, Windows and OSX (I refuse to use the current
+    name for anything but the original Macintosh operating system), Gtk is
+    used for error messages (in preparation to use it also for other GUI
+    elements which SDL lacks).
+
 0.25a (23022104)
 ================
 

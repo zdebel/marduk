@@ -26,7 +26,7 @@
  *       similar license terms.
  */
 
-#define VERSION "0.25a"
+#define VERSION "0.25g"
 
 /* C99 includes */
 #include <errno.h>
@@ -53,6 +53,11 @@
 #else
 /* SDL2 include */
 #include <SDL.h>
+
+/* XXX: and for OSX we use...? */
+#if (!defined(_WIN32))&&(!defined(__APPLE__))
+#include <gtk/gtk.h>
+#endif
 #define diag_printf printf
 #endif
 
@@ -138,6 +143,9 @@ unsigned next_watchdog;
 int keyjoy;
 uint8_t joybyte;
 #define JOY_THRESH 2048 /* distance from center to "trip"; 0..32767 */
+
+FILE *lpt;
+uint8_t lpt_data;
 
 #ifdef __MSDOS__
 /*
@@ -446,6 +454,7 @@ void port_write(z80 *mycpu, uint8_t port, uint8_t val)
   switch (port)
   {
   case 0x00:
+    if ((val&0x04)&&(!(ctrlreg&0x04))&&(lpt)) fputc(lpt_data, lpt);
     ctrlreg = val;
     return;
   case 0x40: /* write data to PSG */
@@ -496,6 +505,9 @@ void port_write(z80 *mycpu, uint8_t port, uint8_t val)
   case 0xA1:
     vrEmuTms9918WriteAddr(vdp, val);
     return;
+  case 0xB0:
+    if (lpt) lpt_data=val;
+    return;
 #ifdef PORT_DEBUG
   default:
     printf("WARNING: unknown port write (0x%02X): 0x%02X\n", port, val);
@@ -506,15 +518,19 @@ void port_write(z80 *mycpu, uint8_t port, uint8_t val)
 #ifdef __MSDOS__
 
 /*
+ * This is a cruder version of the SDL code found below.  Many comments from
+ * that version will still be relevant here.
+ * 
  * XXX: We need a better way to do this to detect make and break from the 
  *      relevant keys.  Like, say, grabbing INT9.  (But I'm not familiar with
  *      that kind of stuff in 386 mode... -uso.)
  */
-void keyboard_poll()
+void keyboard_poll(void)
 {
  __dpmi_regs regs;
  uint16_t k;
  
+ /* Key in the buffer?  If not, do nothing */
  regs.h.ah=0x01;
  __dpmi_int(0x16, &regs);
  if (regs.x.flags&0x40) return; /* Z */
@@ -935,47 +951,140 @@ void keyboard_poll(void)
         keyboard_buffer_put(k);
       }
       else
-        switch (event.key.keysym.sym)
-        {
-        /* F3 - reset */
-        case SDLK_F3:
-          diag_printf("Reset pressed\n");
+       switch (event.key.keysym.sym)
+       {
+        case SDLK_F1: /* F1 - set A: */
+         break;
+        case SDLK_F2: /* F2 - set B: */
+         break;
+        case SDLK_F3: /* F3 - reset */
+         diag_printf("Reset pressed\n");
 #ifndef _WIN32
-          clock_gettime(CLOCK_REALTIME, &timespec);
-          next_fire = timespec.tv_nsec + FIRE_TICK;
+         clock_gettime(CLOCK_REALTIME, &timespec);
+         next_fire = timespec.tv_nsec + FIRE_TICK;
 #endif
-          reinit_cpu();
+         reinit_cpu();
+         break;
+        case SDLK_F4: /* Alt-F4 - exit */
+         if (SDL_GetModState() & KMOD_ALT)
+           death_flag = 1;
+         break;
+        case SDLK_F5: /* F5 - disable keyboard joystick */
+         keyjoy=0;
+         joybyte=0;
+         diag_printf ("Arrows and Space are KEYBOARD\n");
+         break;
+        case SDLK_F6: /* F6 - enable keyboard joystick */
+         keyjoy=1;
+         diag_printf ("Arrows and Space are JOYSTICK\n");
+         break;
+        case SDLK_F7: /* F7 - trace (later will be enter debugger) */
+         trace=!trace;
+         diag_printf ("CPU Trace is now %s\n", trace?"ON":"OFF");
+         break;
+#ifdef DEBUG
+        /*
+         * F9 - creates a command line to load a file.
+         * This will be folded into the debugger eventually, but it is a good
+         * way to test certain things before the disk system is ready.
+         */
+        case SDLK_F9:
+        {
+         FILE *file;
+         char buf1[128],buf2[128];
+         uint16_t sa, a, s;
+         int c;
+         s=0;
+         printf ("import file>");
+         fgets(buf1,127,stdin);
+         buf1[strlen(buf1)-1]=0;
+         if (!*buf1) break;
+         
+         printf ("import addr>0x");
+         fgets(buf2,127,stdin);
+         buf2[strlen(buf2)-1]=0;
+         if (!*buf2) break;
+        
+         sa=a=strtol(buf2,0,16);
+         file=fopen(buf1,"rb");
+         if (!file)
+         {
+          perror(buf1);
           break;
-        /* Alt-F4 - exit */
-        case SDLK_F4:
-          if (SDL_GetModState() & KMOD_ALT)
-            death_flag = 1;
-          break;
-         case SDLK_F5:
-          keyjoy=0;
-          joybyte=0;
-          diag_printf ("Arrows and Space are KEYBOARD\n");
-          break;
-         case SDLK_F6:
-          keyjoy=1;
-          diag_printf ("Arrows and Space are JOYSTICK\n");
-          break;
-         case SDLK_F7:
-          trace=!trace;
-          diag_printf ("CPU Trace is now %s\n", trace?"ON":"OFF");
-          break;
-        /* F10 - also exit */
-        case SDLK_F10:
-          death_flag = 1;
-          break;
+         }
+         printf ("import '%s' $%04X ", buf1, a);
+         while (1)
+         {
+          c=fgetc(file);
+          if (c<0) break;
+          s++;
+          mem_write(NULL, (a++)&0xFFFF, c);
+         }
+         fclose(file);
+         printf ("L=$%04X\n", s);
+         printf ("go (y/n)? ");
+         fgets(buf1,127,stdin);
+         if ((*buf1=='y')||(*buf1=='y'))
+         {
+          cpu.pc=sa;
+          printf ("go to $%04X\n", sa);
+         }
+         break;
         }
+#endif
+        case SDLK_F10: /* F10 - also exit */
+         death_flag = 1;
+         break;
+       }
       break;
-    case SDL_QUIT:
+     case SDL_QUIT: /* someone killed our window */
       death_flag = 1;
       break;
     }
   }
 }
+#endif
+
+/*
+ * Speed control. XXX: this is missing on MS-DOS.
+ * 
+ * On Windows, the routines we use elsewhere do exist, in libpthread, but in
+ * my experience, they're flaky.  Substitute some code that is known to work.
+ */
+#ifdef _WIN32
+/* Sloppy - from modapple */
+void throttle (void)
+{
+  
+ QueryPerformanceCounter(&currenttime);
+ while (currenttime.QuadPart<wantedtime)
+ {
+   QueryPerformanceCounter(&currenttime);
+   SwitchToThread();
+ }
+ wantedtime=currenttime.QuadPart+looptimedesired;
+}
+#else
+# ifdef __MSDOS__
+void throttle (void)
+{
+}
+# else
+/* POSIX version */
+void throttle (void)
+{
+ struct timespec n;
+
+ clock_gettime(CLOCK_REALTIME, &timespec);
+ n.tv_sec = 0;
+ n.tv_nsec = next_fire - timespec.tv_nsec;
+ next_fire = timespec.tv_nsec + FIRE_TICK;
+ if (next_fire > n.tv_nsec)
+ {
+  nanosleep(&n, 0);
+ }
+}
+# endif
 #endif
 
 /*
@@ -989,47 +1098,21 @@ void keyboard_poll(void)
  */
 void every_scanline(void)
 {
-#ifndef __MSDOS__
-  struct timespec n;
-#endif
-  
   keyboard_poll();
-#ifdef _WIN32
-  /* Sloppy - from modapple */
-  
-  QueryPerformanceCounter(&currenttime);
-  while (currenttime.QuadPart<wantedtime)
-  {
-    QueryPerformanceCounter(&currenttime);
-    SwitchToThread();
-  }
-  wantedtime=currenttime.QuadPart+looptimedesired;
-#else
-# ifndef __MSDOS__
-  clock_gettime(CLOCK_REALTIME, &timespec);
-  n.tv_sec = 0;
-  n.tv_nsec = next_fire - timespec.tv_nsec;
-  next_fire = timespec.tv_nsec + FIRE_TICK;
-  if (next_fire > n.tv_nsec)
-  {
-    nanosleep(&n, 0);
-  }
-# endif
-#endif
+  throttle();
 }
 
 /*
  * Exactly what it says on the tin.
- *
  * Call the TMS9918 emulator to generate the next scanline into the offscreen.
  */
+#ifdef __MSDOS__ /* Simplified 320x200 raw-memory version */
 void render_scanline(int line)
 {
   int x;
   uint32_t r;
   uint32_t bg;
   uint8_t a_scanline[256];
-#ifdef __MSDOS__ /* Simplified 320x200 raw-memory version */
   uint8_t g_scanline[320];
   if ((line<0)||(line > 199)) return;
 
@@ -1084,7 +1167,14 @@ void render_scanline(int line)
   display[63645]=(ctrlreg&0x20)?0x1E:0x10; /* Yellow LED */
   display[63647]=(ctrlreg&0x10)?0x1C:0x10; /* Red LED */
   display[63649]=(ctrlreg&0x08)?0x1A:0x10; /* Green LED */
+}
 #else /* The full 640x480 SDL version */
+void render_scanline(int line)
+{
+  int x;
+  uint32_t r;
+  uint32_t bg;
+  uint8_t a_scanline[256];
   uint32_t g_scanline[320];
   if (line > 239)
     return;
@@ -1222,25 +1312,27 @@ void render_scanline(int line)
       display[r + 640 + 631] = ri[2];
     }
   }
-#endif
 }
+#endif
 
 /*
  * End of frame.  Blit it out.
- *
  * Also for anything that needs done every 1/60 second.
  */
+#ifdef __MSDOS__
 void next_frame(void)
 {
-#ifdef __MSDOS__
   memcpy (vgamem, display, 64000);
+}
 #else
+void next_frame(void)
+{
   SDL_UpdateTexture(texture, 0, display, 640 * sizeof(uint32_t));
   SDL_RenderClear(renderer);
   SDL_RenderCopy(renderer, texture, 0, 0);
   SDL_RenderPresent(renderer);
-#endif
 }
+#endif
 
 /*
  * Set up the CPU emulation.
@@ -1411,6 +1503,21 @@ void deinitty(void)
 }
 #endif
 
+/*
+ * On MS-DOS: 
+ *   Turn off the graphics subsystem, write an error to stderr and die.
+ * 
+ * On Windows and *x not Apple:
+ *   Display a message dialog box with the Fatal bit set and die.
+ *   (The Fatal bit should show a "stop" icon of some sort.  On Windows this
+ *    is a red circle with an X.  On Gtk and Qt this is a Do Not Enter sign.
+ *    XXX: Our GTK error dialog doesn't display these things correctly.)
+ * 
+ * On Apple:
+ *   XXX
+ *   Currently we just write an error to stderr and die, but we should do the
+ *   same thing as other unices.
+ */
 void fatal_diag (int code, char *message)
 {
 #ifdef __MSDOS__
@@ -1419,6 +1526,16 @@ void fatal_diag (int code, char *message)
 #ifdef _WIN32
  /* 16 = stop / red X */
  MessageBox(0, message, "Marduk", 16);
+#elif (!defined(__APPLE__))&&(!defined(__MSDOS__))
+ GtkWidget *widget;
+ 
+ widget=gtk_message_dialog_new(0, GTK_DIALOG_DESTROY_WITH_PARENT, GTK_MESSAGE_ERROR, 
+                               GTK_BUTTONS_CLOSE, "Marduk");
+ gtk_message_dialog_format_secondary_text(GTK_MESSAGE_DIALOG(widget), "%s",
+                                          message);
+ 
+ gtk_dialog_run(GTK_DIALOG(widget));
+ gtk_widget_destroy(widget);
 #else
  fprintf(stderr, "%s\n", message);
 #endif
@@ -1482,21 +1599,23 @@ int main(int argc, char **argv)
   ttyup=0;
 #else
   SDL_version sdlver;
-
+  
   SDL_GetVersion(&sdlver);
 #endif
 
-  dojoy=0;
+  /* Defaults */
+  dojoy=1;
   trace=0;
   noinitmodem=0;
   dog_speed=58000;
+  lpt=NULL;
 
   /* This is still relevant for MS-DOS, thank you Watt-32 */
   server = "127.0.0.1";
   port = "5816";
   
   bios = ROMFILE1;
-  while (-1 != (e = getopt(argc, argv, "48B:jJS:P:N")))
+  while (-1 != (e = getopt(argc, argv, "48B:jJS:P:Np:")))
   {
     switch (e)
     {
@@ -1524,9 +1643,14 @@ int main(int argc, char **argv)
     case 'P':
       port = optarg;
       break;
+    case 'p':
+      if (lpt) fclose(lpt); /* in case multiple times specified */
+      lpt=fopen(optarg, "wb");
+      break;
     default:
       fprintf(stderr, 
-              "usage: %s [-4 | 8 | -B filename] [-J] [-S server] [-P port]\n",
+              "usage: %s [-4 | 8 | -B filename] [-S server] [-P port]"
+              " [-p file]\n",
               argv[0]);
       return 1;
     }
@@ -1539,7 +1663,7 @@ int main(int argc, char **argv)
   printf("Marduk version " VERSION " NABU Emulator\n"
 #endif
          "  Copyright 2022, 2023 S. V. Nickolas.\n"
-         "  Copyright 2023 Marcin Wołoszczuk.\n"
+         "  Copyright 2023 Marcin Woloszczuk.\n"
          "  Z80 emulation code copyright 2019 Nicolas Allemand.\n"
          "  Includes vrEmuTms9918 copyright 2021, 2022 Troy Schrapel.\n"
          "  Includes emu2149 copyright 2001-2022 Mitsutaka Okazaki.\n");
@@ -1561,13 +1685,49 @@ int main(int argc, char **argv)
    * surface, and allocate memory for our offscreen buffer.
    *
    * If any of this fails, die screaming.
+   * 
+   * This will be interrupted by Gtk initialization because we might need to
+   * display an error dialog.
    */
-  if (SDL_Init(SDL_INIT_EVERYTHING))
-  {
-    fatal_diag(2, "FATAL: Could not start SDL");
-    return 2;
-  }
+  e=SDL_Init(SDL_INIT_EVERYTHING);
 
+  /*
+   * SDL MUST be initialized before Gtk, or attempts to use Gtk with SDL will
+   * segvee.  https://discourse.libsdl.org/t/gtk2-sdl2-partial-fail/19274
+   * If SDL fails, we're probably safe to try initializing Gtk anyway but it
+   * will most likely die its own screaming death.
+   * 
+   * Gtk wants to peek at our command line... I say NUTS!  Especially since
+   * hacking on our command line could cause Gtk and SDL to go out of synch.
+   */
+#if (!defined(_WIN32))&&(!defined(__APPLE__))
+  gtk_init(NULL, NULL);
+#endif
+  if (e)
+   fatal_diag(2, "FATAL: Could not start SDL");
+
+  /*
+   * Must be done as soon as possible after setting up SDL, especially on
+   * Windows.  The Gtk voodoo can come earlier; it won't run on Windows.
+   */
+  if (dojoy)
+   joystick=SDL_JoystickOpen(0); /* non-fatal; just NULL if none attached */
+  else
+   joystick=NULL;
+
+  /*
+   * Load the ROM, then set it visible. 
+   * Originally done after we set up SDL, but that results in a half-drawn
+   * window and an error diagnostic, so moved up here.
+   */
+  if (init_rom(bios))
+    return 1;
+  printf("ROM size: %u KB\n", romsize >> 10);
+
+  /*
+   * Now ready to set up our window and the necessary resources to actually do
+   * stuff with it.  If at any time this process fails, die screaming.
+   */
   screen = SDL_CreateWindow("Marduk", SDL_WINDOWPOS_UNDEFINED,
                             SDL_WINDOWPOS_UNDEFINED, 640, 480, 0);
   if (!screen)
@@ -1590,6 +1750,12 @@ int main(int argc, char **argv)
   }
 #endif
 
+  /*
+   * Rejoin the common core.
+   * Even on MS-DOS we will use an offscreen buffer; this will be beneficial
+   * with the debugger when we need to flick in and out of text mode.
+   * If we can't set aside enough memory for a full offscreen, die screaming.
+   */
 #ifdef __MSDOS__
   display = malloc(64000);
 #else
@@ -1601,8 +1767,11 @@ int main(int argc, char **argv)
     return 2;
   }
 
+  /*
+   * Set up the sound driver.
+   * Currently this only works with SDL, but that's everything that isn't DOS.
+   */
 #ifndef __MSDOS__
-  /* audio stuff */
   SDL_zero(audio_spec);
   audio_spec.freq = 44100;
   audio_spec.format = AUDIO_S16LSB;
@@ -1612,30 +1781,21 @@ int main(int argc, char **argv)
 
   audio_device = SDL_OpenAudioDevice(NULL, 0, &audio_spec, NULL, 0);
   SDL_PauseAudioDevice(audio_device, 0);
-  
-  if (dojoy)
-   joystick=SDL_JoystickOpen(0); /* non-fatal; just NULL if none attached */
-  else
-   joystick=NULL;
 #endif
 
   /*
-   * Set up the VDP emulation.
-   *
-   * If it fails, die screaming.
+   * Set up the chipset.
+   * Note that the PSG still has to run even if there isn't a sound driver,
+   * because it takes care of other things than just the sound (nonobvious).
    */
+  
+  /* Set up the VDP emulation.  If it fails, die screaming. */
   vdp = vrEmuTms9918New();
   if (!vdp)
-  {
     fatal_diag(3, "FATAL: Could not set up VDP emulation");
-  }
   vrEmuTms9918Reset(vdp);
 
-  /*
-   * Set up the PSG emulation.
-   *
-   * If it fails, die screaming.
-   */
+  /* Set up the PSG emulation.  If it fails, die screaming. */
   psg = PSG_new(1789772, 44100);
   if (!psg)
   {
@@ -1645,17 +1805,15 @@ int main(int argc, char **argv)
   PSG_reset(psg);
   
   /*
-   * Load the ROM, then set it visible.
-   */
-  if (init_rom(bios))
-    return 1;
-  printf("ROM size: %u KB\n", romsize >> 10);
-
-  /*
    * Set up the modem.
    *
    * modem_init() returns 0=success, -1=failure, but our internal flag needs
    * 1=success, 0=failure so use ! to quickly make that change.
+   * 
+   * noinitmodem exists because of a BUG on MS-DOS: I don't currently know how
+   * to do an initialization of Watt-32 that doesn't die screaming if it can't
+   * set up the stack.  For this app, a working TCP stack isn't mandatory, so
+   * Watt-32 failing to initialize should not be fatal.
    */
   if (noinitmodem)
     e = -1;
@@ -1689,6 +1847,8 @@ int main(int argc, char **argv)
   init_cpu();
 
   death_flag = scanline = 0;
+  
+  /* Reset our timer counters. */
 #ifdef _WIN32
   wantedtime=0;
   QueryPerformanceFrequency(&throttlerate);
@@ -1705,6 +1865,7 @@ int main(int argc, char **argv)
 
   int16_t sound_sample = 0;
 
+  /* Main event loop */
   while (!death_flag)
   {
     if (cpu.cyc > next)
@@ -1768,6 +1929,7 @@ int main(int argc, char **argv)
 
   /* Clean up and exit properly. */
   printf("Shutting down emulation\n");
+  if (lpt) fclose(lpt);
   if (gotmodem)
     modem_deinit();
   PSG_delete(psg);
