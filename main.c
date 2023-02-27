@@ -41,7 +41,7 @@
  * MS-DOS (DJGPP):
  *   Use BIOS to access hardware, redirected through DPMI
  *   XXX: we need to completely disable sigint, sigquit etc. in DJGPP
- * 
+ *
  * Otherwise:
  *   Use SDL for hardware abstraction
  */
@@ -64,6 +64,7 @@
 #include "tms9918.h"
 #include "tms_util.h"
 #include "emu2149.h"
+#include "jwd1797.h"
 #include "z80.h"
 
 /* Cable modem include */
@@ -79,7 +80,7 @@ static void reinit_cpu(void);
 void fatal_diag(int, char *);
 
 /* Extern declaration */
-void cpustatus (z80 *cpu);
+void cpustatus(z80 *cpu);
 
 int trace;
 
@@ -88,7 +89,7 @@ int trace;
  *
  * Not exact, but it helps keep the speed more or less even based on how long
  * it takes to run one scanline's worth of code.
- * 
+ *
  * XXX: no support for this on MS-DOS.
  */
 #ifdef __MSDOS__
@@ -97,10 +98,11 @@ int trace;
 #define FIRE_TICK 63492
 unsigned long long next_fire;
 struct timespec timespec;
+struct timespec timespec2;
 #endif
 
 #ifdef _WIN32
-LARGE_INTEGER currenttime,throttlerate;
+LARGE_INTEGER currenttime, throttlerate;
 long long wantedtime, looptimedesired;
 #endif
 
@@ -120,6 +122,7 @@ int romsize;
 z80 cpu;
 VrEmuTms9918 *vdp;
 PSG *psg;
+JWD1797 *fdc;
 int ctrlreg;
 
 int gotmodem;
@@ -310,6 +313,7 @@ uint8_t hccarint = 0;
 uint8_t hccatint = 0;
 uint8_t keybdint = 0;
 uint8_t vdpint = 0;
+uint8_t fdcint = 0;
 uint8_t interrupts = 0;
 uint8_t prev_int_line = 0;
 
@@ -347,6 +351,14 @@ void update_interrupts()
   {
     interrupts &= ~0x10;
   }
+  if (fdcint)
+  {
+    interrupts |= 0x08;
+  }
+  else
+  {
+    interrupts &= ~0x08;
+  }
   int int_prio = ~(interrupts & psg_porta);
   int GS, Q0, Q1, Q2, EO;
   int_prio_enc_alt(0, int_prio, &GS, &Q0, &Q1, &Q2, &EO);
@@ -372,7 +384,7 @@ void keyboard_buffer_put(uint8_t code)
 
 int keyboard_buffer_empty()
 {
-  if (keyboard_buffer_read_ptr == keyboard_buffer_write_ptr) 
+  if (keyboard_buffer_read_ptr == keyboard_buffer_write_ptr)
   {
     return 1;
   }
@@ -381,11 +393,73 @@ int keyboard_buffer_empty()
 
 uint8_t keyboard_buffer_get()
 {
-  if (keyboard_buffer_read_ptr != keyboard_buffer_write_ptr) 
+  if (keyboard_buffer_read_ptr != keyboard_buffer_write_ptr)
   {
     return keyboard_buffer[keyboard_buffer_read_ptr++];
   }
   return 255;
+}
+
+/* HERE WE GO, FDC, welcome to the big league */
+uint8_t fdc_status_reg = 0x26;
+
+void fdc_cmd_restore(uint8_t cmd)
+{
+  printf("fdc_cmd_restore, 0x%02X\r\n", cmd);
+}
+
+void fdc_cmd_interrupt(uint8_t cmd)
+{
+  uint8_t interrupt_mask = cmd & 0x0f;
+  printf("fdc_cmd_interrupt, mask: 0x%02X\r\n", interrupt_mask);
+}
+
+void fdc_cmd_read_address(uint8_t cmd)
+{
+  printf("fdc_cmd_read_address, 0x%02X\r\n", cmd);
+}
+
+void fdc_cmd(uint8_t cmd)
+{
+  switch (cmd & 0xF0)
+  {
+  case 0xD0:
+    fdc_cmd_interrupt(cmd);
+    break;
+  default:
+    printf("not implemented command: 0x%02X\r\n", cmd);
+  }
+}
+
+uint8_t fdc_read(uint8_t addr)
+{
+  uint8_t b;
+  printf("FDC READ 0x%02X\r\n", addr);
+  /* ID */
+  switch (addr & 0x0F)
+  {
+  case 0x00:
+    b = fdc_status_reg;
+    printf("0x%02X\r\n", b);
+    return fdc_status_reg;
+  case 0x0F:
+    return 0x10;
+  default:
+    return 0xFF;
+  }
+  return 0;
+}
+
+void fdc_write(uint8_t addr, uint8_t b)
+{
+  switch (addr)
+  {
+  case 0xC0:
+    fdc_cmd(b);
+    break;
+  default:
+    printf("not implemented: FDC WRITE 0x%02X: %02X\r\n", addr, b);
+  }
 }
 
 /* used for latching PSG's register address */
@@ -432,6 +506,25 @@ uint8_t port_read(z80 *mycpu, uint8_t port)
     vdpint = 0;
     update_interrupts();
     return b;
+  case 0xC0:
+  case 0xC1:
+  case 0xC2:
+  case 0xC3:
+  case 0xC4:
+  case 0xC5:
+  case 0xC6:
+  case 0xC7:
+  case 0xC8:
+  case 0xC9:
+  case 0xCA:
+  case 0xCB:
+  case 0xCC:
+  case 0xCD:
+  case 0xCE:
+    b = fdc_read(port);
+    return b;
+  case 0xCF:
+    return 0x10;
   default:
 #ifdef PORT_DEBUG
     printf("WARNING: unknown port read (0x%02X)\n", port);
@@ -459,7 +552,6 @@ void port_write(z80 *mycpu, uint8_t port, uint8_t val)
       }
       if (val & 0x10)
       {
-
       }
       if (psg_porta != val)
       {
@@ -496,6 +588,25 @@ void port_write(z80 *mycpu, uint8_t port, uint8_t val)
   case 0xA1:
     vrEmuTms9918WriteAddr(vdp, val);
     return;
+  case 0xC0:
+  case 0xC1:
+  case 0xC2:
+  case 0xC3:
+  case 0xC4:
+  case 0xC5:
+  case 0xC6:
+  case 0xC7:
+  case 0xC8:
+  case 0xC9:
+  case 0xCA:
+  case 0xCB:
+  case 0xCC:
+  case 0xCD:
+  case 0xCE:
+    fdc_write(port, val);
+  case 0xCF:
+    //ignore for the moment
+    return;
 #ifdef PORT_DEBUG
   default:
     printf("WARNING: unknown port write (0x%02X): 0x%02X\n", port, val);
@@ -506,121 +617,123 @@ void port_write(z80 *mycpu, uint8_t port, uint8_t val)
 #ifdef __MSDOS__
 
 /*
- * XXX: We need a better way to do this to detect make and break from the 
+ * XXX: We need a better way to do this to detect make and break from the
  *      relevant keys.  Like, say, grabbing INT9.  (But I'm not familiar with
  *      that kind of stuff in 386 mode... -uso.)
  */
 void keyboard_poll()
 {
- __dpmi_regs regs;
- uint16_t k;
- 
- regs.h.ah=0x01;
- __dpmi_int(0x16, &regs);
- if (regs.x.flags&0x40) return; /* Z */
- 
- regs.h.ah=0x00;
- __dpmi_int(0x16, &regs);
- k=regs.x.ax;
- 
- if (keyjoy&&((k&0xFF)==0x20))
- {
- }
- 
- if (k==0x0E08) /* BkSp */
- {
-  keyboard_buffer_put(0x7F);
-  return;
- }
+  __dpmi_regs regs;
+  uint16_t k;
 
- /* Plain, ordinary, ASCII */
- if ((k&0xFF)&&(!(k&0x80)))
- {
-  keyboard_buffer_put(k&0x7F);
-  return;
- }
- 
- switch (k>>8)
- {
+  regs.h.ah = 0x01;
+  __dpmi_int(0x16, &regs);
+  if (regs.x.flags & 0x40)
+    return; /* Z */
+
+  regs.h.ah = 0x00;
+  __dpmi_int(0x16, &regs);
+  k = regs.x.ax;
+
+  if (keyjoy && ((k & 0xFF) == 0x20))
+  {
+  }
+
+  if (k == 0x0E08) /* BkSp */
+  {
+    keyboard_buffer_put(0x7F);
+    return;
+  }
+
+  /* Plain, ordinary, ASCII */
+  if ((k & 0xFF) && (!(k & 0x80)))
+  {
+    keyboard_buffer_put(k & 0x7F);
+    return;
+  }
+
+  switch (k >> 8)
+  {
   case 0x48: /* up */
-   if (keyjoy)
-   {
-   }
-   else
-   {
-    keyboard_buffer_put(0xE2);
-    keyboard_buffer_put(0xF2);
-   }
-   break;
+    if (keyjoy)
+    {
+    }
+    else
+    {
+      keyboard_buffer_put(0xE2);
+      keyboard_buffer_put(0xF2);
+    }
+    break;
   case 0x50: /* down */
-   if (keyjoy)
-   {
-   }
-   else
-   {
-    keyboard_buffer_put(0xE3);
-    keyboard_buffer_put(0xF3);
-   }
-   break;
+    if (keyjoy)
+    {
+    }
+    else
+    {
+      keyboard_buffer_put(0xE3);
+      keyboard_buffer_put(0xF3);
+    }
+    break;
   case 0x4B: /* left */
-   if (keyjoy)
-   {
-   }
-   else
-   {
-    keyboard_buffer_put(0xE1);
-    keyboard_buffer_put(0xF1);
-   }
-   break;
+    if (keyjoy)
+    {
+    }
+    else
+    {
+      keyboard_buffer_put(0xE1);
+      keyboard_buffer_put(0xF1);
+    }
+    break;
   case 0x4D: /* right */
-   if (keyjoy)
-   {
-   }
-   else
-   {
-    keyboard_buffer_put(0xE0);
-    keyboard_buffer_put(0xF0);
-   }
-   break;
+    if (keyjoy)
+    {
+    }
+    else
+    {
+      keyboard_buffer_put(0xE0);
+      keyboard_buffer_put(0xF0);
+    }
+    break;
   case 0x49: /* PgUp */
-   keyboard_buffer_put(0xE5);
-   keyboard_buffer_put(0xF5);
-   break;
+    keyboard_buffer_put(0xE5);
+    keyboard_buffer_put(0xF5);
+    break;
   case 0x51: /* PgDn */
-   keyboard_buffer_put(0xE4);
-   keyboard_buffer_put(0xF4);
-   break;
+    keyboard_buffer_put(0xE4);
+    keyboard_buffer_put(0xF4);
+    break;
   case 0x52: /* Ins */
-   keyboard_buffer_put(0xE7);
-   keyboard_buffer_put(0xF7);
-   break;
+    keyboard_buffer_put(0xE7);
+    keyboard_buffer_put(0xF7);
+    break;
   case 0x53: /* Del */
-   keyboard_buffer_put(0xE6);
-   keyboard_buffer_put(0xF6);
-   break;
+    keyboard_buffer_put(0xE6);
+    keyboard_buffer_put(0xF6);
+    break;
   case 0x4F: /* End */
-   keyboard_buffer_put(0xEA);
-   keyboard_buffer_put(0xFA);
-   break;
-  
+    keyboard_buffer_put(0xEA);
+    keyboard_buffer_put(0xFA);
+    break;
+
   /* Special Keys */
   case 0x3D: /* F3 */
-#if 0 /* DJGPP doesn't have this */
+#if 0        /* DJGPP doesn't have this */
    clock_gettime(CLOCK_REALTIME, &timespec);
    next_fire = timespec.tv_nsec + FIRE_TICK;
 #endif
-   reinit_cpu();
-   break;
+    reinit_cpu();
+    break;
   case 0x3F: /* F5 */
-   keyjoy=0;
-   joybyte=0;
-   break;
+    keyjoy = 0;
+    joybyte = 0;
+    break;
   case 0x40: /* F6 */
-   keyjoy=1;
-   break;
- }
- 
- if (k==0x4400) death_flag=1;
+    keyjoy = 1;
+    break;
+  }
+
+  if (k == 0x4400)
+    death_flag = 1;
 }
 #else
 void keyboard_poll(void)
@@ -632,70 +745,70 @@ void keyboard_poll(void)
     /* These are irrelevant if the keyboard is emulating the joystick */
     if (!keyjoy)
     {
-     /* Don't care what stick or what button.  Nabu only has one. */
-     switch (event.type)
-     {
+      /* Don't care what stick or what button.  Nabu only has one. */
+      switch (event.type)
+      {
       case SDL_JOYHATMOTION:
-       joybyte&=0xF0;
-       switch (event.jhat.value)
-       {
+        joybyte &= 0xF0;
+        switch (event.jhat.value)
+        {
         case SDL_HAT_LEFTUP:
-         joybyte|=0x09;
-         break;
+          joybyte |= 0x09;
+          break;
         case SDL_HAT_UP:
-         joybyte|=0x08;
-         break;
+          joybyte |= 0x08;
+          break;
         case SDL_HAT_RIGHTUP:
-         joybyte|=0x0C;
-         break;
+          joybyte |= 0x0C;
+          break;
         case SDL_HAT_LEFT:
-         joybyte|=0x01;
-         break;
+          joybyte |= 0x01;
+          break;
         case SDL_HAT_CENTERED:
-         /* Already done */
-         break;
+          /* Already done */
+          break;
         case SDL_HAT_RIGHT:
-         joybyte|=0x04;
-         break;
+          joybyte |= 0x04;
+          break;
         case SDL_HAT_LEFTDOWN:
-         joybyte|=0x03;
-         break;
+          joybyte |= 0x03;
+          break;
         case SDL_HAT_DOWN:
-         joybyte|=0x02;
-         break;
+          joybyte |= 0x02;
+          break;
         case SDL_HAT_RIGHTDOWN:
-         joybyte|=0x06;
-         break;
-       }
+          joybyte |= 0x06;
+          break;
+        }
       case SDL_JOYAXISMOTION:
-       joybyte&=0xF0;
-       switch (event.jaxis.axis)
-       {
+        joybyte &= 0xF0;
+        switch (event.jaxis.axis)
+        {
         case 0: /* X */
-         if (event.jaxis.value<-JOY_THRESH)
-          joybyte|=0x01;
-         else if (event.jaxis.value>JOY_THRESH)
-          joybyte|=0x04;
-         break;
+          if (event.jaxis.value < -JOY_THRESH)
+            joybyte |= 0x01;
+          else if (event.jaxis.value > JOY_THRESH)
+            joybyte |= 0x04;
+          break;
         case 1: /* Y */
-         if (event.jaxis.value<-JOY_THRESH)
-          joybyte|=0x08;
-         else if (event.jaxis.value>JOY_THRESH)
-          joybyte|=0x02;
-         break;
-       }
-       break;
+          if (event.jaxis.value < -JOY_THRESH)
+            joybyte |= 0x08;
+          else if (event.jaxis.value > JOY_THRESH)
+            joybyte |= 0x02;
+          break;
+        }
+        break;
       case SDL_JOYBUTTONDOWN:
-       joybyte |= 0x10;
-       keyboard_buffer_put(0x80);
-       keyboard_buffer_put(joybyte|0xA0);
-       break;
+        joybyte |= 0x10;
+        keyboard_buffer_put(0x80);
+        keyboard_buffer_put(joybyte | 0xA0);
+        break;
       case SDL_JOYBUTTONUP:
-       joybyte &= 0xEF;
-       keyboard_buffer_put(0x80);
-       keyboard_buffer_put(joybyte|0xA0);
-       break;
-     }
+        joybyte &= 0xEF;
+        keyboard_buffer_put(0x80);
+        keyboard_buffer_put(joybyte | 0xA0);
+        break;
+      }
     }
     switch (event.type)
     {
@@ -705,53 +818,53 @@ void keyboard_poll(void)
     case SDL_KEYUP:
       switch (event.key.keysym.sym)
       {
-       case ' ':
+      case ' ':
         if (keyjoy)
         {
-         joybyte &= 0xEF;
-         keyboard_buffer_put(0x80);
-         keyboard_buffer_put(joybyte|0xA0);
+          joybyte &= 0xEF;
+          keyboard_buffer_put(0x80);
+          keyboard_buffer_put(joybyte | 0xA0);
         }
         break;
       case SDLK_UP:
         if (keyjoy)
         {
-         joybyte &= 0xF7;
-         keyboard_buffer_put(0x80);
-         keyboard_buffer_put(joybyte|0xA0);
+          joybyte &= 0xF7;
+          keyboard_buffer_put(0x80);
+          keyboard_buffer_put(joybyte | 0xA0);
         }
         else
-         keyboard_buffer_put(0xF2);
+          keyboard_buffer_put(0xF2);
         break;
       case SDLK_DOWN:
         if (keyjoy)
         {
-         joybyte &= 0xFD;
-         keyboard_buffer_put(0x80);
-         keyboard_buffer_put(joybyte|0xA0);
+          joybyte &= 0xFD;
+          keyboard_buffer_put(0x80);
+          keyboard_buffer_put(joybyte | 0xA0);
         }
         else
-         keyboard_buffer_put(0xF3);
+          keyboard_buffer_put(0xF3);
         break;
       case SDLK_LEFT:
         if (keyjoy)
         {
-         joybyte &= 0xFE;
-         keyboard_buffer_put(0x80);
-         keyboard_buffer_put(joybyte|0xA0);
+          joybyte &= 0xFE;
+          keyboard_buffer_put(0x80);
+          keyboard_buffer_put(joybyte | 0xA0);
         }
         else
-         keyboard_buffer_put(0xF1);
+          keyboard_buffer_put(0xF1);
         break;
       case SDLK_RIGHT:
         if (keyjoy)
         {
-         joybyte &= 0xFB;
-         keyboard_buffer_put(0x80);
-         keyboard_buffer_put(joybyte|0xA0);
+          joybyte &= 0xFB;
+          keyboard_buffer_put(0x80);
+          keyboard_buffer_put(joybyte | 0xA0);
         }
         else
-         keyboard_buffer_put(0xF0);
+          keyboard_buffer_put(0xF0);
         break;
       case SDLK_PAGEUP: /* « */
         keyboard_buffer_put(0xF5);
@@ -779,53 +892,53 @@ void keyboard_poll(void)
        */
       switch (event.key.keysym.sym)
       {
-       case ' ':
+      case ' ':
         if (keyjoy)
         {
-         joybyte |= 0x10;
-         keyboard_buffer_put(0x80);
-         keyboard_buffer_put(joybyte|0xA0);
+          joybyte |= 0x10;
+          keyboard_buffer_put(0x80);
+          keyboard_buffer_put(joybyte | 0xA0);
         }
         break;
       case SDLK_UP:
         if (keyjoy)
         {
-         joybyte |= 0x08;
-         keyboard_buffer_put(0x80);
-         keyboard_buffer_put(joybyte|0xA0);
+          joybyte |= 0x08;
+          keyboard_buffer_put(0x80);
+          keyboard_buffer_put(joybyte | 0xA0);
         }
         else
-         keyboard_buffer_put(0xE2);
+          keyboard_buffer_put(0xE2);
         break;
       case SDLK_DOWN:
         if (keyjoy)
         {
-         joybyte |= 0x02;
-         keyboard_buffer_put(0x80);
-         keyboard_buffer_put(joybyte|0xA0);
+          joybyte |= 0x02;
+          keyboard_buffer_put(0x80);
+          keyboard_buffer_put(joybyte | 0xA0);
         }
         else
-         keyboard_buffer_put(0xE3);
+          keyboard_buffer_put(0xE3);
         break;
       case SDLK_LEFT:
         if (keyjoy)
         {
-         joybyte |= 0x01;
-         keyboard_buffer_put(0x80);
-         keyboard_buffer_put(joybyte|0xA0);
+          joybyte |= 0x01;
+          keyboard_buffer_put(0x80);
+          keyboard_buffer_put(joybyte | 0xA0);
         }
         else
-         keyboard_buffer_put(0xE1);
+          keyboard_buffer_put(0xE1);
         break;
       case SDLK_RIGHT:
         if (keyjoy)
         {
-         joybyte |= 0x04;
-         keyboard_buffer_put(0x80);
-         keyboard_buffer_put(joybyte|0xA0);
+          joybyte |= 0x04;
+          keyboard_buffer_put(0x80);
+          keyboard_buffer_put(joybyte | 0xA0);
         }
         else
-         keyboard_buffer_put(0xE0);
+          keyboard_buffer_put(0xE0);
         break;
       case SDLK_PAGEUP: /* « */
         keyboard_buffer_put(0xE5);
@@ -845,18 +958,18 @@ void keyboard_poll(void)
       case SDLK_END:
         keyboard_buffer_put(0xEA);
         break;
-        
+
       case SDLK_BACKSPACE:
-       keyboard_buffer_put(0x7F);
-       break;
+        keyboard_buffer_put(0x7F);
+        break;
       }
-      if ((event.key.keysym.sym < 128) && 
+      if ((event.key.keysym.sym < 128) &&
           (event.key.keysym.sym != SDLK_BACKSPACE)) /* urk */
       {
         static char *shiftnums = ")!@#$%^&*(";
         SDL_Keymod m;
         int k;
-        
+
         /*
          * Shift/Ctrl translation.  Not the most efficient method.
          *
@@ -869,8 +982,9 @@ void keyboard_poll(void)
          */
 
         k = event.key.keysym.sym;
-        if ((k==' ')&&keyjoy) break; /* we already handled this. */
-        
+        if ((k == ' ') && keyjoy)
+          break; /* we already handled this. */
+
         m = SDL_GetModState();
         if (m & KMOD_CTRL)
         {
@@ -951,18 +1065,18 @@ void keyboard_poll(void)
           if (SDL_GetModState() & KMOD_ALT)
             death_flag = 1;
           break;
-         case SDLK_F5:
-          keyjoy=0;
-          joybyte=0;
-          diag_printf ("Arrows and Space are KEYBOARD\n");
+        case SDLK_F5:
+          keyjoy = 0;
+          joybyte = 0;
+          diag_printf("Arrows and Space are KEYBOARD\n");
           break;
-         case SDLK_F6:
-          keyjoy=1;
-          diag_printf ("Arrows and Space are JOYSTICK\n");
+        case SDLK_F6:
+          keyjoy = 1;
+          diag_printf("Arrows and Space are JOYSTICK\n");
           break;
-         case SDLK_F7:
-          trace=!trace;
-          diag_printf ("CPU Trace is now %s\n", trace?"ON":"OFF");
+        case SDLK_F7:
+          trace = !trace;
+          diag_printf("CPU Trace is now %s\n", trace ? "ON" : "OFF");
           break;
         /* F10 - also exit */
         case SDLK_F10:
@@ -980,7 +1094,7 @@ void keyboard_poll(void)
 
 /*
  * Things to do once per scanline, like poll the keyboard, joystick, etc.
- * 
+ *
  * XXX: Although the entire functionality for slowing the system down is
  *      CLAIMED to be present in -lpthread on Windows, it doesn't actually
  *      seem to do anything, as the emulation still appears to run completely
@@ -992,20 +1106,20 @@ void every_scanline(void)
 #ifndef __MSDOS__
   struct timespec n;
 #endif
-  
+
   keyboard_poll();
 #ifdef _WIN32
   /* Sloppy - from modapple */
-  
+
   QueryPerformanceCounter(&currenttime);
-  while (currenttime.QuadPart<wantedtime)
+  while (currenttime.QuadPart < wantedtime)
   {
     QueryPerformanceCounter(&currenttime);
     SwitchToThread();
   }
-  wantedtime=currenttime.QuadPart+looptimedesired;
+  wantedtime = currenttime.QuadPart + looptimedesired;
 #else
-# ifndef __MSDOS__
+#ifndef __MSDOS__
   clock_gettime(CLOCK_REALTIME, &timespec);
   n.tv_sec = 0;
   n.tv_nsec = next_fire - timespec.tv_nsec;
@@ -1014,7 +1128,7 @@ void every_scanline(void)
   {
     nanosleep(&n, 0);
   }
-# endif
+#endif
 #endif
 }
 
@@ -1031,7 +1145,8 @@ void render_scanline(int line)
   uint8_t a_scanline[256];
 #ifdef __MSDOS__ /* Simplified 320x200 raw-memory version */
   uint8_t g_scanline[320];
-  if ((line<0)||(line > 199)) return;
+  if ((line < 0) || (line > 199))
+    return;
 
   /*
    * To note:
@@ -1044,15 +1159,16 @@ void render_scanline(int line)
   if ((line >= 4) && (line < 196))
   {
     vrEmuTms9918ScanLine(vdp, line - 4, a_scanline);
-    for (x=0; x<256; x++) g_scanline[32+x]=a_scanline[x];
+    for (x = 0; x < 256; x++)
+      g_scanline[32 + x] = a_scanline[x];
   }
 
   /* Double-scan. */
   r = line * 320;
-  for (x=0; x<320; x++)
-   display[r+x]=g_scanline[x];
+  for (x = 0; x < 320; x++)
+    display[r + x] = g_scanline[x];
 
-  /* Apparently some third-party software flips this bit incorrectly. */
+    /* Apparently some third-party software flips this bit incorrectly. */
 #ifdef ALLOW_NTSC_NOISE
   /*
    * If the display is in "TV" mode, just spew some NTSC noise into the buffer.
@@ -1069,7 +1185,7 @@ void render_scanline(int line)
     for (x = 0; x < 320; x++)
     {
       c = rand() & 0xFF;
-      display[r + x] = c?0x1F:0x10;
+      display[r + x] = c ? 0x1F : 0x10;
     }
   }
 #endif
@@ -1078,13 +1194,14 @@ void render_scanline(int line)
    * Draw the LEDs.
    * XXX: Should do something fancier for the joystick
    */
-  
-  if (keyjoy) display[63643]=0x1F;
-  
-  display[63645]=(ctrlreg&0x20)?0x1E:0x10; /* Yellow LED */
-  display[63647]=(ctrlreg&0x10)?0x1C:0x10; /* Red LED */
-  display[63649]=(ctrlreg&0x08)?0x1A:0x10; /* Green LED */
-#else /* The full 640x480 SDL version */
+
+  if (keyjoy)
+    display[63643] = 0x1F;
+
+  display[63645] = (ctrlreg & 0x20) ? 0x1E : 0x10; /* Yellow LED */
+  display[63647] = (ctrlreg & 0x10) ? 0x1C : 0x10; /* Red LED */
+  display[63649] = (ctrlreg & 0x08) ? 0x1A : 0x10; /* Green LED */
+#else                                              /* The full 640x480 SDL version */
   uint32_t g_scanline[320];
   if (line > 239)
     return;
@@ -1150,31 +1267,32 @@ void render_scanline(int line)
     uint32_t le[3], ri[3];
 
     r = line * 1280;
-    
+
     if (keyjoy)
     {
-     uint16_t c;
-     
-     /* 576-583 */
-     if (line==235)
-     {
-      for (c=576; c<584; c++)
+      uint16_t c;
+
+      /* 576-583 */
+      if (line == 235)
       {
-       display[r+c]=display[r+640+c]=0xFF333333;
+        for (c = 576; c < 584; c++)
+        {
+          display[r + c] = display[r + 640 + c] = 0xFF333333;
+        }
       }
-     }
-     else if (line==232)
-     {
-      display[r+579]=display[r+580]=0xFFCC0000;
-      display[r+579+640]=display[r+580+640]=0xFF333333;
-     }
-     else
-     {
-      display[r+579]=display[r+579+640]=0xFF333333;
-      display[r+580]=display[r+580+640]=0xFF333333;
-     }
-      
-     if (line==234) display[r+577]=display[r+577+640]=0xFFCC0000;
+      else if (line == 232)
+      {
+        display[r + 579] = display[r + 580] = 0xFFCC0000;
+        display[r + 579 + 640] = display[r + 580 + 640] = 0xFF333333;
+      }
+      else
+      {
+        display[r + 579] = display[r + 579 + 640] = 0xFF333333;
+        display[r + 580] = display[r + 580 + 640] = 0xFF333333;
+      }
+
+      if (line == 234)
+        display[r + 577] = display[r + 577 + 640] = 0xFFCC0000;
     }
 
     if (line == 232)
@@ -1233,7 +1351,7 @@ void render_scanline(int line)
 void next_frame(void)
 {
 #ifdef __MSDOS__
-  memcpy (vgamem, display, 64000);
+  memcpy(vgamem, display, 64000);
 #else
   SDL_UpdateTexture(texture, 0, display, 640 * sizeof(uint32_t));
   SDL_RenderClear(renderer);
@@ -1325,7 +1443,8 @@ void audio_callback(void *userdata, Uint8 *stream, int len)
 {
   int i;
   int16_t sample;
-  for (i = 0; i < len; i += 2) {
+  for (i = 0; i < len; i += 2)
+  {
     sample = PSG_calc(psg);
     stream[i] = sample & 0xff;
     stream[i + 1] = sample >> 8;
@@ -1338,133 +1457,135 @@ void audio_callback(void *userdata, Uint8 *stream, int len)
  * SDL is operated in 32 BPP mode.
  * On the contrary, however, the MS-DOS version uses an indexed mode with only
  * 256 colors (and in fact we only assign 32 of them currently).
- * 
+ *
  * Translate RGB24 to RGB18 and then output it directly to the VGA registers.
  */
-void palette (uint8_t c, uint8_t r, uint8_t g, uint8_t b)
+void palette(uint8_t c, uint8_t r, uint8_t g, uint8_t b)
 {
- r>>=2;
- g>>=2;
- b>>=2;
- 
- outportb(0x03C8, c);
- outportb(0x03C9, r);
- outportb(0x03C9, g);
- outportb(0x03C9, b);
+  r >>= 2;
+  g >>= 2;
+  b >>= 2;
+
+  outportb(0x03C8, c);
+  outportb(0x03C9, r);
+  outportb(0x03C9, g);
+  outportb(0x03C9, b);
 }
 
 void initty(void)
 {
- __dpmi_regs regs;
- int t;
- 
- /* Unlock conventional memory, like DOS4G */
- if (!__djgpp_nearptr_enable())
- {
-  fatal_diag (2, "FATAL: Could not get access to 8086 memory");
- }
- 
- /* Enter MCGA graphics mode */
- regs.x.ax=0x0013;
- __dpmi_int(0x10, &regs);
- 
- /* Get pointer to video memory */
- vgamem=((uint8_t *)0x000A0000)+__djgpp_conventional_base;
- 
- /* Set palette entries $00-$0F to the TMS9918 colors */
- for (t=0; t<16; t++) 
-  palette(t, vrEmuTms9918Palette[t]>>24, vrEmuTms9918Palette[t]>>16, 
-          vrEmuTms9918Palette[t]>>8);
- 
- /* Set palette entries $10-$1F to the CGA colors for UI elements */
- palette (0x10, 0x00, 0x00, 0x00);
- palette (0x11, 0x00, 0x00, 0xCC);
- palette (0x12, 0x00, 0xCC, 0x00);
- palette (0x13, 0x00, 0xCC, 0xCC);
- palette (0x14, 0xCC, 0x00, 0x00);
- palette (0x15, 0xCC, 0x00, 0xCC);
- palette (0x16, 0xCC, 0x77, 0x00);
- palette (0x17, 0xCC, 0xCC, 0xCC);
- palette (0x18, 0x80, 0x80, 0x80);
- palette (0x19, 0x00, 0x00, 0xFF);
- palette (0x1A, 0x00, 0xFF, 0x00);
- palette (0x1B, 0x00, 0xFF, 0xFF);
- palette (0x1C, 0xFF, 0x00, 0x00);
- palette (0x1D, 0xFF, 0x00, 0xFF);
- palette (0x1E, 0xFF, 0xFF, 0x00);
- palette (0x1F, 0xFF, 0xFF, 0xFF);
+  __dpmi_regs regs;
+  int t;
+
+  /* Unlock conventional memory, like DOS4G */
+  if (!__djgpp_nearptr_enable())
+  {
+    fatal_diag(2, "FATAL: Could not get access to 8086 memory");
+  }
+
+  /* Enter MCGA graphics mode */
+  regs.x.ax = 0x0013;
+  __dpmi_int(0x10, &regs);
+
+  /* Get pointer to video memory */
+  vgamem = ((uint8_t *)0x000A0000) + __djgpp_conventional_base;
+
+  /* Set palette entries $00-$0F to the TMS9918 colors */
+  for (t = 0; t < 16; t++)
+    palette(t, vrEmuTms9918Palette[t] >> 24, vrEmuTms9918Palette[t] >> 16,
+            vrEmuTms9918Palette[t] >> 8);
+
+  /* Set palette entries $10-$1F to the CGA colors for UI elements */
+  palette(0x10, 0x00, 0x00, 0x00);
+  palette(0x11, 0x00, 0x00, 0xCC);
+  palette(0x12, 0x00, 0xCC, 0x00);
+  palette(0x13, 0x00, 0xCC, 0xCC);
+  palette(0x14, 0xCC, 0x00, 0x00);
+  palette(0x15, 0xCC, 0x00, 0xCC);
+  palette(0x16, 0xCC, 0x77, 0x00);
+  palette(0x17, 0xCC, 0xCC, 0xCC);
+  palette(0x18, 0x80, 0x80, 0x80);
+  palette(0x19, 0x00, 0x00, 0xFF);
+  palette(0x1A, 0x00, 0xFF, 0x00);
+  palette(0x1B, 0x00, 0xFF, 0xFF);
+  palette(0x1C, 0xFF, 0x00, 0x00);
+  palette(0x1D, 0xFF, 0x00, 0xFF);
+  palette(0x1E, 0xFF, 0xFF, 0x00);
+  palette(0x1F, 0xFF, 0xFF, 0xFF);
 }
 
 /* Restore last tty state */
 void reinitty(void)
 {
- initty();
- memcpy (vgamem, display, 64000);
+  initty();
+  memcpy(vgamem, display, 64000);
 }
 
 void deinitty(void)
 {
- __dpmi_regs regs;
+  __dpmi_regs regs;
 
- regs.x.ax=0x0003;
- __dpmi_int(0x10, &regs);
+  regs.x.ax = 0x0003;
+  __dpmi_int(0x10, &regs);
 }
 #endif
 
-void fatal_diag (int code, char *message)
+void fatal_diag(int code, char *message)
 {
 #ifdef __MSDOS__
- if (ttyup) deinitty();
+  if (ttyup)
+    deinitty();
 #endif
 #ifdef _WIN32
- /* 16 = stop / red X */
- MessageBox(0, message, "Marduk", 16);
+  /* 16 = stop / red X */
+  MessageBox(0, message, "Marduk", 16);
 #else
- fprintf(stderr, "%s\n", message);
+  fprintf(stderr, "%s\n", message);
 #endif
- exit(code);
+  exit(code);
 }
 
 /*
  * This is a stub.
- * 
+ *
  * Currently, when "trace" is on, we just dump the registers once a Z80
  * operation.  This may be extended at some point in the future into a
  * framework for a proper debugger.
- * 
+ *
  * This code is called from nowhere.
  */
-void debugger (void)
+void debugger(void)
 {
- char buf[128];
- 
+  char buf[128];
+
 #ifdef __MSDOS__
- deinitty();
+  deinitty();
 #endif
- 
- while (1)
- {
-  cpustatus(&cpu);
-  putchar ('-');
-top:
-  fgets(buf, 127, stdin);
-  if (feof(stdin))
+
+  while (1)
   {
-   death_flag=1;
-   return;
+    cpustatus(&cpu);
+    putchar('-');
+  top:
+    fgets(buf, 127, stdin);
+    if (feof(stdin))
+    {
+      death_flag = 1;
+      return;
+    }
+    buf[strlen(buf) - 1] = 0;
+    if (!*buf)
+      return;
+
+    if (*buf == 'q')
+    {
+      death_flag = 1;
+      return;
+    }
   }
-  buf[strlen(buf)-1]=0;
-  if (!*buf) return;
-  
-  if (*buf=='q')
-  {
-   death_flag=1;
-   return;
-  }
- }
- 
+
 #ifdef __MSDOS__
- reinitty();
+  reinitty();
 #endif
 }
 
@@ -1477,24 +1598,24 @@ int main(int argc, char **argv)
   int scanline;
   int noinitmodem;
   int dojoy;
-  
+
 #ifdef __MSDOS__
-  ttyup=0;
+  ttyup = 0;
 #else
   SDL_version sdlver;
 
   SDL_GetVersion(&sdlver);
 #endif
 
-  dojoy=0;
-  trace=0;
-  noinitmodem=0;
-  dog_speed=58000;
+  dojoy = 0;
+  trace = 0;
+  noinitmodem = 0;
+  dog_speed = 58000;
 
   /* This is still relevant for MS-DOS, thank you Watt-32 */
   server = "127.0.0.1";
   port = "5816";
-  
+
   bios = ROMFILE1;
   while (-1 != (e = getopt(argc, argv, "48B:jJS:P:N")))
   {
@@ -1507,16 +1628,16 @@ int main(int argc, char **argv)
       bios = ROMFILE2;
       break;
     case 'j':
-     dojoy=0;
-     break;
+      dojoy = 0;
+      break;
     case 'J':
-     dojoy=1;
-     break;
+      dojoy = 1;
+      break;
     case 'B':
       bios = optarg;
       break;
     case 'N': /* Not currently documenting this */
-      noinitmodem=1;
+      noinitmodem = 1;
       break;
     case 'S':
       server = optarg;
@@ -1525,7 +1646,7 @@ int main(int argc, char **argv)
       port = optarg;
       break;
     default:
-      fprintf(stderr, 
+      fprintf(stderr,
               "usage: %s [-4 | 8 | -B filename] [-J] [-S server] [-P port]\n",
               argv[0]);
       return 1;
@@ -1612,11 +1733,11 @@ int main(int argc, char **argv)
 
   audio_device = SDL_OpenAudioDevice(NULL, 0, &audio_spec, NULL, 0);
   SDL_PauseAudioDevice(audio_device, 0);
-  
+
   if (dojoy)
-   joystick=SDL_JoystickOpen(0); /* non-fatal; just NULL if none attached */
+    joystick = SDL_JoystickOpen(0); /* non-fatal; just NULL if none attached */
   else
-   joystick=NULL;
+    joystick = NULL;
 #endif
 
   /*
@@ -1643,7 +1764,7 @@ int main(int argc, char **argv)
   }
   PSG_setVolumeMode(psg, 2);
   PSG_reset(psg);
-  
+
   /*
    * Load the ROM, then set it visible.
    */
@@ -1677,7 +1798,7 @@ int main(int argc, char **argv)
 
 #ifdef __MSDOS__
   initty(); /* Now we're ready to kick into MCGA mode. */
-  ttyup=1;
+  ttyup = 1;
 #endif
 
   /*
@@ -1690,14 +1811,15 @@ int main(int argc, char **argv)
 
   death_flag = scanline = 0;
 #ifdef _WIN32
-  wantedtime=0;
+  wantedtime = 0;
   QueryPerformanceFrequency(&throttlerate);
-  looptimedesired=throttlerate.QuadPart/15720;
+  looptimedesired = throttlerate.QuadPart / 15720;
 #else
-# ifndef __MSDOS__
+#ifndef __MSDOS__
   clock_gettime(CLOCK_REALTIME, &timespec);
+  clock_gettime(CLOCK_REALTIME, &timespec2);
   next_fire = timespec.tv_nsec + FIRE_TICK;
-# endif
+#endif
 #endif
   next_watchdog = 0;
   keyjoy = joybyte = 0;
@@ -1717,7 +1839,7 @@ int main(int argc, char **argv)
         update_interrupts();
       }
 
-      if (!keyboard_buffer_empty() && !keybdint) 
+      if (!keyboard_buffer_empty() && !keybdint)
       {
         keybdint = 1;
         update_interrupts();
@@ -1757,11 +1879,12 @@ int main(int argc, char **argv)
       next += 228;
     }
 #ifndef __MSDOS__
-    if (trace) cpustatus(&cpu);
+    if (trace)
+      cpustatus(&cpu);
 #endif
     z80_step(&cpu);
   }
-  
+
 #ifdef __MSDOS__ /* Return to text mode */
   deinitty();
 #endif
@@ -1775,7 +1898,7 @@ int main(int argc, char **argv)
   free(display);
 #ifndef __MSDOS__
   if (joystick)
-   SDL_JoystickClose(joystick);
+    SDL_JoystickClose(joystick);
   SDL_Quit();
 #endif
 

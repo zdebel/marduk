@@ -26,14 +26,17 @@ LIBS   := $(LIBS) `sdl2-config --libs`
 
 all:	marduk
 
-marduk:	dasm80.o emu2149.o main.o modem.o tms9918.o tms_util.o z80.o
-	$(CC) $(CFLAGS) -o marduk dasm80.o emu2149.o main.o modem.o tms9918.o tms_util.o z80.o $(LIBS)
+marduk:	dasm80.o emu2149.o jwd1797.o main.o modem.o tms9918.o tms_util.o z80.o
+	$(CC) $(CFLAGS) -o marduk dasm80.o emu2149.o jwd1797.o main.o modem.o tms9918.o tms_util.o z80.o $(LIBS)
 
 dasm80.o:	dasm80.c z80.h
 	$(CC) $(CFLAGS) -c -o dasm80.o dasm80.c
 
 emu2149.o:	emu2149.c emu2149.h
 	$(CC) $(CFLAGS) -c -o emu2149.o emu2149.c
+
+jwd1797.o: jwd1797.c jwd1797.h
+	$(CC) $(CFLAGS) -c -o jwd1797.o jwd1797.c
 
 main.o:	main.c emu2149.h modem.h tms9918.h tms_util.h z80.h
 	$(CC) $(CFLAGS) -c -o main.o main.c
@@ -51,4 +54,4 @@ z80.o:	z80.c z80.h
 	$(CC) $(CFLAGS) -c -o z80.o z80.c
 
 clean:
-	rm -f marduk dasm80.o emu2149.o main.o modem.o tms9918.o tms_util.o z80.o
+	rm -f marduk *.o
